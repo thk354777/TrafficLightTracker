@@ -1,71 +1,102 @@
 import cv2
 import numpy as np
 from ultralytics import YOLO
+from collections import deque
 
-# Load the YOLO model
+# Load YOLO model
 model = YOLO("yolo11n.pt")
 
-# Open the video file
+# Open video
 video_path = "cam.mp4"
 cap = cv2.VideoCapture(video_path)
 
-def detect_circle_and_color(frame, bbox):
-    """
-    Detect circles (ไฟ traffic light) เฉพาะ ROI ของ bounding box
-    และตรวจสอบสี (แดง/เขียว)
-    """
+# Temporal smoothing
+frame_labels = deque(maxlen=100)
+
+def detect_traffic_light_color(frame, bbox):
     x1, y1, x2, y2 = bbox
     roi = frame[y1:y2, x1:x2]
 
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    gray = cv2.medianBlur(gray, 3)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-    # Hough Circle สำหรับไฟเล็ก
-    circles = cv2.HoughCircles(
-        gray,
-        cv2.HOUGH_GRADIENT,
-        dp=1,
-        minDist=100,
-        param1=50,
-        param2=20,
-        minRadius=2,
-        maxRadius=60
-    )
+    # Red mask
+    lower_red1 = np.array([0,100,100])
+    upper_red1 = np.array([10,255,255])
+    lower_red2 = np.array([160,100,100])
+    upper_red2 = np.array([180,255,255])
+    mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
 
-    if circles is not None:
-        circles = np.uint16(np.around(circles))
-        for c in circles[0, :]:
-            cx, cy, r = c
-            center = (x1 + cx, y1 + cy)
-            # วาด circle
-            cv2.circle(frame, center, r, (0, 255, 0), 2)
-            cv2.circle(frame, center, 2, (0, 0, 255), 3)
+    # Green mask
+    lower_green = np.array([40,50,50])
+    upper_green = np.array([85,255,255])
+    mask_green = cv2.inRange(hsv, lower_green, upper_green)
 
-            # ตรวจสอบสีภายในวง
-            mask = np.zeros(roi.shape[:2], dtype=np.uint8)
-            cv2.circle(mask, (cx, cy), r, 255, -1)
-            masked_roi = cv2.bitwise_and(roi, roi, mask=mask)
+    label = "UNKNOWN"
 
-            # แปลงเป็น HSV
-            hsv = cv2.cvtColor(masked_roi, cv2.COLOR_BGR2HSV)
-            # เฉลี่ยค่า hue ของ pixel ใน mask
-            h, s, v = cv2.split(hsv)
-            h_mean = cv2.mean(h, mask=mask)[0]
+    def check_mask(mask, color_name):
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if 5 < area < 500:
+                ((cx, cy), r) = cv2.minEnclosingCircle(cnt)
+                mask_roi = cv2.bitwise_and(roi, roi, mask=mask)
+                _, s, v = cv2.split(cv2.cvtColor(mask_roi, cv2.COLOR_BGR2HSV))
+                s_mean = cv2.mean(s, mask=mask)[0]
+                v_mean = cv2.mean(v, mask=mask)[0]
+                if s_mean > 50 and v_mean > 50:
+                    # Background text
+                    text = color_name
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    scale = 0.5
+                    thickness = 1
+                    (text_width, text_height), baseline = cv2.getTextSize(text, font, scale, thickness)
+                    x_text = int(cx)+x1
+                    y_text = int(cy)+y1 - int(r) - 5
+                    cv2.rectangle(frame,
+                                (x_text, y_text - text_height - baseline),
+                                (x_text + text_width, y_text + baseline),
+                                (0,0,0), cv2.FILLED)
+                    cv2.putText(frame, text, (x_text, y_text), font, scale, (255,255,255), thickness)
+                    return color_name
+        return None
 
-            label = "UNKNOWN"
+    res = check_mask(mask_red, "RED")
+    if res is not None:
+        label = res
+    else:
+        res = check_mask(mask_green, "GREEN")
+        if res is not None:
+            label = res
 
-            # กำหนด label ตาม hue (คร่าว ๆ)
-            if 0 <= h_mean <= 10 or 160 <= h_mean <= 180:
-                label = "RED"
-                print("RED light detected")
-            elif 40 <= h_mean <= 85:
-                label = "GREEN"
-                print("GREEN light detected")
+    frame_labels.append(label)
+    most_common = max(set(frame_labels), key=frame_labels.count)
+    return most_common
 
-            cv2.putText(frame, label, (center[0]-10, center[1]-r-5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+def detect_lanes(frame):
+    """
+    Lane detection using Canny + ROI + Hough Transform
+    """
+    height, width = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    edges = cv2.Canny(blur, 50, 150)
 
-# Loop through video frames
+    # ROI: ครึ่งล่างของ frame
+    mask = np.zeros_like(edges)
+    roi_vertices = np.array([[(0, int(height/1.3)), (width, int(height/1.3)), (width, height), (0, height)]], dtype=np.int32)
+    cv2.fillPoly(mask, roi_vertices, 255)
+    masked_edges = cv2.bitwise_and(edges, mask)
+
+    # Hough Lines
+    lines = cv2.HoughLinesP(masked_edges, 1, np.pi/180, threshold=50, minLineLength=50, maxLineGap=50)
+    lane_frame = np.zeros_like(frame)
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            cv2.line(lane_frame, (x1,y1), (x2,y2), (0,255,0), 2)
+    return lane_frame
+
+# Loop video frames
 while cap.isOpened():
     success, frame = cap.read()
     if not success:
@@ -80,9 +111,13 @@ while cap.isOpened():
         for box, cls, score in zip(boxes.xyxy, boxes.cls, scores):
             x1, y1, x2, y2 = map(int, box)
             if int(cls) == 9 and score > 0.3:
-                detect_circle_and_color(annotated_frame, (x1, y1, x2, y2))
+                detect_traffic_light_color(annotated_frame, (x1, y1, x2, y2))
 
-    cv2.imshow("YOLO + Traffic Light Color", annotated_frame)
+    # Lane detection window
+    lane_frame = detect_lanes(frame)
+
+    cv2.imshow("Traffic Light Detection", annotated_frame)
+    cv2.imshow("Lane Detection", lane_frame)
 
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
